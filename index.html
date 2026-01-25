@@ -157,7 +157,11 @@
         // Frames loaded from binary file
         let frames = null;
         let dataLoaded = false;
-        const chunkNames = ["aa", "ab", "ac", "ad", "ae"];
+        let allFramesLoaded = false;
+        let loadedFrameCount = 0;
+        const chunkCount = 5;
+        const framesPerChunk = numFrames / chunkCount; // 288 frames per chunk
+        let onAllFramesLoaded = null; // Callback when all frames are loaded
 
         const constellationColors = {
             ISS: 'rgb(255,255,255)', Starlink: 'rgb(100,180,255)', OneWeb: 'rgb(255,160,100)',
@@ -176,7 +180,7 @@
         }
         const constellationVisible = { ISS: true, Starlink: true, OneWeb: true, Planet: true, Spire: true, Iridium: true, SSO: true, LEO53: true, Other: true };
 
-        // Load binary position data
+        // Load binary position data progressively
         async function loadPositionData() {
             const loadingDiv = document.createElement('div');
             loadingDiv.id = 'loadingOverlay';
@@ -188,43 +192,152 @@
             style.textContent = '.loading-content{text-align:center;color:#fff;font-family:Inter,sans-serif;}.loading-spinner{width:48px;height:48px;border:3px solid rgba(0,212,255,0.2);border-top-color:#00d4ff;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 20px;}.loading-text{font-size:16px;margin-bottom:8px;}.loading-progress{font-family:JetBrains Mono,monospace;color:#00d4ff;font-size:14px;}@keyframes spin{to{transform:rotate(360deg);}}';
             document.head.appendChild(style);
 
+            // Add background loading indicator styles
+            const bgStyle = document.createElement('style');
+            bgStyle.textContent = `
+                #bgLoadingIndicator {
+                    position: fixed;
+                    bottom: 20px;
+                    left: 20px;
+                    background: rgba(8,12,24,0.9);
+                    border: 1px solid rgba(0,212,255,0.3);
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    font-family: Inter, sans-serif;
+                    color: #fff;
+                    font-size: 13px;
+                    z-index: 1000;
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    backdrop-filter: blur(8px);
+                    transition: opacity 0.3s, transform 0.3s;
+                }
+                #bgLoadingIndicator.hidden {
+                    opacity: 0;
+                    transform: translateY(20px);
+                    pointer-events: none;
+                }
+                .bg-spinner {
+                    width: 16px;
+                    height: 16px;
+                    border: 2px solid rgba(0,212,255,0.2);
+                    border-top-color: #00d4ff;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                }
+                .bg-progress-bar {
+                    width: 120px;
+                    height: 4px;
+                    background: rgba(255,255,255,0.1);
+                    border-radius: 2px;
+                    overflow: hidden;
+                }
+                .bg-progress-fill {
+                    height: 100%;
+                    background: linear-gradient(90deg, #00d4ff, #00ff88);
+                    transition: width 0.3s;
+                }
+                #seekSlider:disabled, #speed:disabled {
+                    opacity: 0.4;
+                    cursor: not-allowed;
+                }
+            `;
+            document.head.appendChild(bgStyle);
+
             try {
-                // Load chunked gzipped files and reassemble
-                const chunks = [];
-                let totalLoaded = 0;
-                const estimatedTotal = chunkNames.length * 50 * 1024 * 1024; // ~50MB per chunk
+                // Pre-allocate the full frames array
+                const totalFloats = numFrames * numSats * 3;
+                frames = new Float32Array(totalFloats);
 
-                for (let i = 0; i < chunkNames.length; i++) {
-                    const response = await fetch(`cesium_positions.bin.gz.part_${chunkNames[i]}`);
-                    if (!response.ok) throw new Error(`Chunk ${chunkNames[i]} not found`);
-                    const chunk = await response.arrayBuffer();
-                    chunks.push(new Uint8Array(chunk));
-                    totalLoaded += chunk.byteLength;
-                    document.getElementById('loadProgress').textContent = Math.round((i + 1) / chunkNames.length * 100) + '%';
-                }
+                // Load first chunk to show visualization immediately
+                const firstResponse = await fetch('cesium_positions_chunk_0.bin.gz');
+                if (!firstResponse.ok) throw new Error('Chunk 0 not found');
+                const firstChunkCompressed = new Uint8Array(await firstResponse.arrayBuffer());
 
-                // Combine chunks
-                const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-                const combined = new Uint8Array(totalLength);
-                let offset = 0;
-                for (const chunk of chunks) {
-                    combined.set(chunk, offset);
-                    offset += chunk.length;
-                }
-
-                // Decompress
                 document.getElementById('loadProgress').textContent = 'Decompressing...';
-                const decompressed = await new Response(
-                    new Blob([combined]).stream().pipeThrough(new DecompressionStream('gzip'))
+                const firstDecompressed = await new Response(
+                    new Blob([firstChunkCompressed]).stream().pipeThrough(new DecompressionStream('gzip'))
                 ).arrayBuffer();
-                frames = new Float32Array(decompressed);
+                const firstFrameData = new Float32Array(firstDecompressed);
+
+                // Copy first chunk data into frames array
+                frames.set(firstFrameData, 0);
+                loadedFrameCount = framesPerChunk;
 
                 document.getElementById('loadProgress').textContent = 'Initializing...';
                 dataLoaded = true;
                 loadingDiv.remove();
+
+                // Initialize visualization with first chunk
                 initializeVisualization();
+
+                // Load remaining chunks in background
+                loadRemainingChunks(firstFrameData.length);
+
             } catch (err) {
                 loadingDiv.innerHTML = '<div style="color:#ff6b6b;font-family:Inter,sans-serif;text-align:center;"><div style="font-size:24px;margin-bottom:12px;">Failed to load satellite data</div><div style="font-size:14px;opacity:0.7;">' + err.message + '</div></div>';
+            }
+        }
+
+        // Load remaining data chunks in background
+        async function loadRemainingChunks(startOffset) {
+            // Create background loading indicator
+            const bgIndicator = document.createElement('div');
+            bgIndicator.id = 'bgLoadingIndicator';
+            bgIndicator.innerHTML = `
+                <div class="bg-spinner"></div>
+                <span>Loading animation data...</span>
+                <div class="bg-progress-bar"><div class="bg-progress-fill" id="bgProgressFill" style="width: 20%"></div></div>
+                <span id="bgProgressText">20%</span>
+            `;
+            document.body.appendChild(bgIndicator);
+
+            const progressFill = document.getElementById('bgProgressFill');
+            const progressText = document.getElementById('bgProgressText');
+
+            let currentOffset = startOffset;
+
+            try {
+                for (let i = 1; i < chunkCount; i++) {
+                    const response = await fetch(`cesium_positions_chunk_${i}.bin.gz`);
+                    if (!response.ok) throw new Error(`Chunk ${i} not found`);
+                    const chunkCompressed = new Uint8Array(await response.arrayBuffer());
+
+                    const decompressed = await new Response(
+                        new Blob([chunkCompressed]).stream().pipeThrough(new DecompressionStream('gzip'))
+                    ).arrayBuffer();
+                    const chunkData = new Float32Array(decompressed);
+
+                    // Copy chunk data into frames array
+                    frames.set(chunkData, currentOffset);
+                    currentOffset += chunkData.length;
+                    loadedFrameCount = (i + 1) * framesPerChunk;
+
+                    // Update progress
+                    const percent = Math.round(((i + 1) / chunkCount) * 100);
+                    progressFill.style.width = percent + '%';
+                    progressText.textContent = percent + '%';
+                }
+
+                // All frames loaded
+                allFramesLoaded = true;
+                loadedFrameCount = numFrames;
+
+                // Enable time controls
+                document.getElementById('seekSlider').disabled = false;
+                document.getElementById('speed').disabled = false;
+
+                // Rebuild orbit paths with complete data
+                if (onAllFramesLoaded) onAllFramesLoaded();
+
+                // Hide and remove indicator
+                bgIndicator.classList.add('hidden');
+                setTimeout(() => bgIndicator.remove(), 300);
+
+            } catch (err) {
+                bgIndicator.innerHTML = `<span style="color:#ff6b6b;">Failed to load remaining data: ${err.message}</span>`;
+                setTimeout(() => bgIndicator.remove(), 5000);
             }
         }
 
@@ -281,17 +394,23 @@
         // Orbit paths
         const orbitSatIndices = []; const orbitStep = Math.floor(numSats / 50);
         for (let i = 0; i < numSats; i += orbitStep) orbitSatIndices.push(i);
-        const allOrbitPositions = {};
-        for (const idx of orbitSatIndices) {
-            const pos = [];
-            for (let f = 0; f < numFrames; f++) {
-                const offset = f * numSats * 3 + idx * 3;
-                pos.push(new Cesium.Cartesian3(frames[offset], frames[offset+1], frames[offset+2]));
-            }
-            pos.push(pos[0]);
-            allOrbitPositions[idx] = pos;
-        }
+        let allOrbitPositions = {};
         let orbitCollection = viewer.scene.primitives.add(new Cesium.PolylineCollection());
+
+        // Build orbit positions from loaded frames
+        function buildOrbitPositions() {
+            allOrbitPositions = {};
+            const framesToUse = allFramesLoaded ? numFrames : loadedFrameCount;
+            for (const idx of orbitSatIndices) {
+                const pos = [];
+                for (let f = 0; f < framesToUse; f++) {
+                    const offset = f * numSats * 3 + idx * 3;
+                    pos.push(new Cesium.Cartesian3(frames[offset], frames[offset+1], frames[offset+2]));
+                }
+                if (allFramesLoaded) pos.push(pos[0]); // Close the loop only when complete
+                allOrbitPositions[idx] = pos;
+            }
+        }
 
         function rebuildOrbitPaths() {
             viewer.scene.primitives.remove(orbitCollection);
@@ -308,7 +427,16 @@
                 }
             }
         }
+
+        // Build initial orbits with loaded frames
+        buildOrbitPositions();
         rebuildOrbitPaths();
+
+        // Set callback to rebuild orbits when all frames are loaded
+        onAllFramesLoaded = () => {
+            buildOrbitPositions();
+            rebuildOrbitPaths();
+        };
 
         // State
         let simTime = startFrame, paused = false, speed = 0.05, seekMode = false;
@@ -322,11 +450,20 @@
         seekSlider.value = startFrame;
         seekVal.textContent = formatFrameTime(startFrame);
 
-        // Update positions to a specific frame
+        // Disable time controls until all data is loaded
+        if (!allFramesLoaded) {
+            seekSlider.disabled = true;
+            document.getElementById('speed').disabled = true;
+        }
+
+        // Update positions to a specific frame (clamp to loaded frames)
         function updatePositions(frameIdx) {
-            const f1 = Math.floor(frameIdx);
-            const f2 = (f1 + 1) % numFrames;
-            const t = frameIdx - f1;
+            // Clamp to loaded frames if not all data is available
+            const maxFrame = allFramesLoaded ? numFrames - 1 : Math.max(0, loadedFrameCount - 2);
+            const clampedIdx = Math.min(frameIdx, maxFrame);
+            const f1 = Math.floor(clampedIdx);
+            const f2 = Math.min(f1 + 1, maxFrame);
+            const t = clampedIdx - f1;
             const base1 = f1 * numSats * 3;
             const base2 = f2 * numSats * 3;
             for (let i = 0; i < numSats; i++) {
@@ -349,6 +486,13 @@
             frameCount++;
             const now = performance.now();
             if (now - lastTime >= 1000) { document.getElementById('fps').textContent = frameCount; frameCount = 0; lastTime = now; }
+
+            // While loading, stay on frame 0; once loaded, animate normally
+            if (!allFramesLoaded) {
+                updatePositions(0);
+                return;
+            }
+
             if (paused || seekMode) return;
 
             simTime += speed * 0.03; if (simTime >= numFrames) simTime -= numFrames;
